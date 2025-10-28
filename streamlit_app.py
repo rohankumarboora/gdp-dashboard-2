@@ -1,151 +1,282 @@
-import streamlit as st
+
+import io
+import os
+import numpy as np
 import pandas as pd
-import math
-from pathlib import Path
+import matplotlib.pyplot as plt
+import seaborn as sns
+import streamlit as st
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    roc_auc_score, accuracy_score, f1_score, precision_score, recall_score,
+    confusion_matrix, roc_curve, precision_recall_curve
+)
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+
+st.set_page_config(page_title="Diabetes Prediction – Model Bench", layout="wide")
+sns.set_style("whitegrid")
+
+# ------------- Sidebar Controls -------------
+st.sidebar.title("⚙️ Controls")
+
+uploaded = st.sidebar.file_uploader("Upload CSV (expects 'Diabetes_binary' as target)", type=["csv"])
+default_path = "diabetes dataset.csv"
+
+test_size = st.sidebar.slider("Test size", 0.1, 0.4, 0.20, 0.01)
+random_state = st.sidebar.number_input("Random state", min_value=0, value=42, step=1)
+
+rf_n_estimators = st.sidebar.slider("Random Forest: n_estimators", 100, 1000, 300, 50)
+gb_learning_rate = st.sidebar.select_slider("Gradient Boosting: learning_rate", options=[0.01, 0.05, 0.1, 0.2], value=0.1)
+threshold = st.sidebar.slider("Classification threshold", 0.1, 0.9, 0.5, 0.01)
+topn_importance = st.sidebar.slider("Top-N feature importance", 5, 30, 15, 1)
+
+st.sidebar.markdown("---")
+st.sidebar.info("Tip: Run this app with: `streamlit run streamlit_app.py`.\n\nIf no file is uploaded, the app looks for **diabetes dataset.csv** in the working directory.")
+
+# ------------- Data Loading -------------
+@st.cache_data(show_spinner=False)
+def load_data(file_buffer, fallback_path):
+    if file_buffer is not None:
+        df = pd.read_csv(file_buffer)
+    else:
+        if not os.path.exists(fallback_path):
+            raise FileNotFoundError(
+                "No file uploaded and default 'diabetes dataset.csv' not found in current directory."
+            )
+        df = pd.read_csv(fallback_path)
+    return df
+
+try:
+    df = load_data(uploaded, default_path)
+except Exception as e:
+    st.error(f"❌ {e}")
+    st.stop()
+
+st.success(f"Loaded dataset with shape {df.shape}")
+with st.expander("🔎 Preview & Columns", expanded=False):
+    st.write(df.head())
+    st.write("Columns:", list(df.columns))
+
+if "Diabetes_binary" not in df.columns:
+    st.error("Expected target column 'Diabetes_binary' not found!")
+    st.stop()
+
+# Split X, y and coerce numerics
+y = df["Diabetes_binary"].astype(int)
+X = df.drop(columns=["Diabetes_binary"]).copy()
+for c in X.columns:
+    X[c] = pd.to_numeric(X[c], errors="coerce")
+
+# Train/test split
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=test_size, random_state=random_state, stratify=y
 )
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+# Preprocess & models (constructed with current sidebar params)
+numeric_preprocess = Pipeline([
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", StandardScaler())
+])
 
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
+models = {
+    "Logistic Regression": Pipeline([
+        ("prep", numeric_preprocess),
+        ("clf", LogisticRegression(max_iter=1000, random_state=random_state))
+    ]),
+    "Random Forest": Pipeline([
+        ("prep", numeric_preprocess),
+        ("clf", RandomForestClassifier(n_estimators=rf_n_estimators, random_state=random_state, n_jobs=-1))
+    ]),
+    "Gradient Boosting": Pipeline([
+        ("prep", numeric_preprocess),
+        ("clf", GradientBoostingClassifier(random_state=random_state, learning_rate=gb_learning_rate))
+    ])
+}
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
+# ------------- Training & Evaluation -------------
+def evaluate_model(name, pipe, X_train, X_test, y_train, y_test, thr=0.5):
+    pipe.fit(X_train, y_train)
+    proba = None
+    if hasattr(pipe.named_steps["clf"], "predict_proba"):
+        proba = pipe.predict_proba(X_test)[:, 1]
+    elif hasattr(pipe.named_steps["clf"], "decision_function"):
+        scores = pipe.decision_function(X_test)
+        proba = (scores - scores.min()) / (scores.max() - scores.min() + 1e-9)
 
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
+    y_pred = (proba >= thr).astype(int) if proba is not None else pipe.predict(X_test)
 
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
+    metrics = {
+        "AUC": roc_auc_score(y_test, proba) if proba is not None else np.nan,
+        "Accuracy": accuracy_score(y_test, y_pred),
+        "Precision": precision_score(y_test, y_pred, zero_division=0),
+        "Recall": recall_score(y_test, y_pred),
+        "F1": f1_score(y_test, y_pred),
+        "ConfusionMatrix": confusion_matrix(y_test, y_pred),
+        "proba": proba,
+        "y_pred": y_pred
+    }
+    return metrics, pipe
 
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
-    )
+# IMPORTANT FIX:
+# Use @st.cache_resource but ignore the unhashable 'models' dict by prefixing with underscore.
+@st.cache_resource(show_spinner=True)
+def train_all_models(_models_dict, X_train, X_test, y_train, y_test, thr):
+    results = {}
+    fitted = {}
+    for name, pipe in _models_dict.items():
+        res, fitted_pipe = evaluate_model(name, pipe, X_train, X_test, y_train, y_test, thr=thr)
+        results[name] = res
+        fitted[name] = fitted_pipe
+    return results, fitted
 
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
+with st.spinner("Training models..."):
+    results, fitted = train_all_models(models, X_train, X_test, y_train, y_test, threshold)
 
-    return gdp_df
+# Metrics table
+metrics_table = pd.DataFrame({
+    mname: {
+        "AUC": res["AUC"],
+        "Accuracy": res["Accuracy"],
+        "Precision": res["Precision"],
+        "Recall": res["Recall"],
+        "F1": res["F1"]
+    } for mname, res in results.items()
+}).T
 
-gdp_df = get_gdp_data()
+# Helper to pick best by AUC
+def pick_best(table):
+    auc_vals = table["AUC"].fillna(-np.inf)
+    best_by_auc = auc_vals.idxmax()
+    return best_by_auc, table.loc[best_by_auc, "AUC"]
 
-# -----------------------------------------------------------------------------
-# Draw the actual page
+best_model_name, best_auc = pick_best(metrics_table)
 
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
+# ------------- Layout: Tabs -------------
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "📊 Overview", "📈 ROC & PR", "🧮 Confusion Matrices",
+    "🌲 Feature Importance", "📋 Compare Metrics", "🔮 Predict Single Case"
+])
 
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
+with tab1:
+    st.subheader("Overall Evaluation")
+    st.dataframe(metrics_table.round(4))
+    st.info(f"**Best model by AUC:** {best_model_name}  (AUC = {best_auc:.4f})")
 
-# Add some spacing
-''
-''
+with tab2:
+    col_roc, col_pr = st.columns(2)
+    with col_roc:
+        fig, ax = plt.subplots(figsize=(5, 4))
+        for name, res in results.items():
+            if res["proba"] is not None:
+                fpr, tpr, _ = roc_curve(y_test, res["proba"])
+                ax.plot(fpr, tpr, lw=2, label=f"{name} (AUC = {res['AUC']:.3f})")
+        ax.plot([0, 1], [0, 1], "--", color="gray", lw=1, label="Random (AUC = 0.500)")
+        ax.set_title("ROC Curves")
+        ax.set_xlabel("False Positive Rate (1 - Specificity)")
+        ax.set_ylabel("True Positive Rate (Recall)")
+        ax.legend(loc="lower right", frameon=True, fontsize=8)
+        ax.set_xlim([0, 1])
+        ax.set_ylim([0, 1])
+        st.pyplot(fig)
 
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
+    with col_pr:
+        fig2, ax2 = plt.subplots(figsize=(5, 4))
+        for name, res in results.items():
+            if res["proba"] is not None:
+                prec, rec, _ = precision_recall_curve(y_test, res["proba"])
+                ax2.plot(rec, prec, lw=2, label=f"{name}")
+        baseline = y_test.mean()
+        ax2.hlines(baseline, 0, 1, linestyles="--", label=f"Prevalence = {baseline:.2f}")
+        ax2.set_title("Precision–Recall Curves")
+        ax2.set_xlabel("Recall (Sensitivity)")
+        ax2.set_ylabel("Precision (PPV)")
+        ax2.legend(loc="best", frameon=True, fontsize=8)
+        ax2.set_xlim([0, 1])
+        ax2.set_ylim([0, 1])
+        st.pyplot(fig2)
 
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
+with tab3:
+    st.subheader("Confusion Matrices")
+    cols = st.columns(3)
+    for idx, (name, res) in enumerate(results.items()):
+        cm = res["ConfusionMatrix"]
+        fig_cm, ax_cm = plt.subplots(figsize=(4.5, 4))
+        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", cbar=False, ax=ax_cm,
+                    annot_kws={"size": 12})
+        ax_cm.set_title(f"{name}")
+        ax_cm.set_xlabel("Predicted Label")
+        ax_cm.set_ylabel("True Label")
+        ax_cm.set_xticklabels(["0 (No Diabetes)", "1 (Diabetes)"], rotation=20)
+        ax_cm.set_yticklabels(["0 (No Diabetes)", "1 (Diabetes)"], rotation=0)
+        cols[idx].pyplot(fig_cm)
 
-countries = gdp_df['Country Code'].unique()
+with tab4:
+    st.subheader("Tree-Based Feature Importances")
+    def plot_feature_importance(pipe, title, feature_names, top_n=15):
+        clf = pipe.named_steps["clf"]
+        if hasattr(clf, "feature_importances_"):
+            importances = pd.Series(clf.feature_importances_, index=feature_names)
+            top = importances.sort_values(ascending=False).head(top_n)[::-1]
+            fig_imp, ax_imp = plt.subplots(figsize=(6, 5))
+            ax_imp.barh(top.index, top.values)
+            ax_imp.set_title(f"Top {top_n} Features: {title}")
+            ax_imp.set_xlabel("Importance (Gini decrease)")
+            ax_imp.set_ylabel("Feature")
+            fig_imp.tight_layout()
+            return fig_imp
+        return None
 
-if not len(countries):
-    st.warning("Select at least one country")
-
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
-
-''
-''
-''
-
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
-
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
-)
-
-''
-''
-
-
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
-
-st.header(f'GDP in {to_year}', divider='gray')
-
-''
-
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
+    for name in ["Random Forest", "Gradient Boosting"]:
+        fig_imp = plot_feature_importance(fitted[name], name, X.columns, top_n=topn_importance)
+        if fig_imp is not None:
+            st.pyplot(fig_imp)
         else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
+            st.warning(f"{name} has no attribute 'feature_importances_'")
 
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
-        )
+with tab5:
+    st.subheader("Metric Comparison")
+    comp = metrics_table[["AUC", "Accuracy", "F1"]].copy()
+    fig_bar, ax_bar = plt.subplots(figsize=(7, 4))
+    comp.plot(kind="bar", rot=0, ax=ax_bar)
+    ax_bar.set_title("Model Comparison: AUC, Accuracy, F1")
+    ax_bar.set_xlabel("Model")
+    ax_bar.set_ylabel("Score")
+    ax_bar.set_ylim(0, 1)
+    ax_bar.legend(title="Metric", loc="lower right", frameon=True, fontsize=8)
+    ax_bar.grid(axis="y", linestyle="--", alpha=0.5)
+    fig_bar.tight_layout()
+    st.pyplot(fig_bar)
+
+with tab6:
+    st.subheader("Predict for a Single Person")
+    st.caption("Enter feature values below. (Defaults are the **median** of the training data.)")
+
+    defaults = X_train.median(numeric_only=True)
+    cols = st.columns(3)
+    user_input = {}
+    for i, col in enumerate(X.columns):
+        with cols[i % 3]:
+            val = float(defaults[col]) if pd.notna(defaults[col]) else 0.0
+            user_input[col] = st.number_input(col, value=val, format="%.4f")
+
+    input_df = pd.DataFrame([user_input])
+    chosen_model = st.selectbox("Choose model for inference", list(models.keys()), index=list(models.keys()).index(best_model_name))
+    if st.button("Predict"):
+        mdl = fitted[chosen_model]
+        if hasattr(mdl.named_steps["clf"], "predict_proba"):
+            proba = mdl.predict_proba(input_df)[0, 1]
+        elif hasattr(mdl.named_steps["clf"], "decision_function"):
+            score = mdl.decision_function(input_df)[0]
+            proba = 1 / (1 + np.exp(-score))
+        else:
+            proba = float(mdl.predict(input_df)[0])
+        pred = int(proba >= threshold)
+        st.metric(label="Predicted Probability of Diabetes", value=f"{proba:.3f}")
+        st.metric(label="Predicted Class (with current threshold)", value=str(pred))
+
+st.caption("Built with scikit-learn pipelines • Median imputation + Standardization • Auto-plots for ROC/PR and Confusion Matrices.")
