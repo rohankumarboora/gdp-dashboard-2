@@ -338,7 +338,3 @@ with tab6:
             st.error("Prediction: **Diabetes**")
         else:
             st.success("Prediction: **No Diabetes**")
-
-        
-
-st.caption("Built with scikit-learn pipelines-plots for ROC/PR and Confusion Matrices.")
