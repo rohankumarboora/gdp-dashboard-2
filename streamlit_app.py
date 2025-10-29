@@ -122,8 +122,7 @@ def evaluate_model(name, pipe, X_train, X_test, y_train, y_test, thr=0.5):
     }
     return metrics, pipe
 
-# IMPORTANT FIX:
-# Use @st.cache_resource but ignore the unhashable 'models' dict by prefixing with underscore.
+# Cache training, ignoring unhashable 'models' dict
 @st.cache_resource(show_spinner=True)
 def train_all_models(_models_dict, X_train, X_test, y_train, y_test, thr):
     results = {}
@@ -252,31 +251,94 @@ with tab5:
     fig_bar.tight_layout()
     st.pyplot(fig_bar)
 
+
 with tab6:
     st.subheader("Predict for a Single Person")
-    st.caption("Enter feature values below. (Defaults are the **median** of the training data.)")
+    st.caption("Binary features (0/1) are shown as dropdowns. Others are text boxes. Empty/invalid inputs fallback to training **median**.")
 
     defaults = X_train.median(numeric_only=True)
-    cols = st.columns(3)
-    user_input = {}
-    for i, col in enumerate(X.columns):
-        with cols[i % 3]:
-            val = float(defaults[col]) if pd.notna(defaults[col]) else 0.0
-            user_input[col] = st.number_input(col, value=val, format="%.4f")
 
-    input_df = pd.DataFrame([user_input])
+    # Detect binary columns: non-null unique values subset of {0,1}
+    binary_cols = set()
+    for col in X.columns:
+        vals = pd.Series(X[col]).dropna().unique()
+        if len(vals) > 0:
+            # Coerce to floats then compare set membership
+            try:
+                vals = np.array(vals, dtype=float)
+                unique_set = set(np.unique(vals).tolist())
+                if unique_set.issubset({0.0, 1.0}):
+                    binary_cols.add(col)
+            except Exception:
+                pass
+
+    cols_layout = st.columns(3)
+    user_input_raw = {}
+
+    for i, col in enumerate(X.columns):
+        with cols_layout[i % 3]:
+            if col in binary_cols:
+                # Default to rounded median within {0,1}
+                dflt = defaults.get(col, 0.0)
+                try:
+                    dflt = int(round(float(dflt)))
+                except Exception:
+                    dflt = 0
+                dflt = 1 if dflt == 1 else 0
+                choice = st.selectbox(col, options=[0,1], index=[0,1].index(dflt))
+                user_input_raw[col] = choice
+            else:
+                placeholder = "" if pd.isna(defaults.get(col, np.nan)) else str(float(defaults[col]))
+                txt = st.text_input(col, value="", placeholder=placeholder)
+                user_input_raw[col] = txt
+
+    # Build parsed dataframe
+    parsed = {}
+    parse_warnings = []
+
+    for col in X.columns:
+        val = user_input_raw[col]
+        if col in binary_cols:
+            # Already int 0/1 from selectbox
+            parsed[col] = int(val)
+        else:
+            # Text -> float with median fallback
+            if val is None or str(val).strip() == "":
+                parsed[col] = float(defaults[col]) if pd.notna(defaults[col]) else 0.0
+            else:
+                try:
+                    parsed[col] = float(val)
+                except Exception:
+                    parsed[col] = float(defaults[col]) if pd.notna(defaults[col]) else 0.0
+                    parse_warnings.append(col)
+
+    input_df = pd.DataFrame([parsed])
     chosen_model = st.selectbox("Choose model for inference", list(models.keys()), index=list(models.keys()).index(best_model_name))
+
     if st.button("Predict"):
+        if parse_warnings:
+            st.warning(f"These fields were non-numeric and were replaced by their median: {', '.join(parse_warnings)}")
+
         mdl = fitted[chosen_model]
+
+        # Probability + class using current threshold
         if hasattr(mdl.named_steps["clf"], "predict_proba"):
             proba = mdl.predict_proba(input_df)[0, 1]
+            pred = int(proba >= threshold)
         elif hasattr(mdl.named_steps["clf"], "decision_function"):
             score = mdl.decision_function(input_df)[0]
             proba = 1 / (1 + np.exp(-score))
+            pred = int(proba >= threshold)
         else:
-            proba = float(mdl.predict(input_df)[0])
-        pred = int(proba >= threshold)
-        st.metric(label="Predicted Probability of Diabetes", value=f"{proba:.3f}")
-        st.metric(label="Predicted Class (with current threshold)", value=str(pred))
+            pred = int(mdl.predict(input_df)[0])
+            # If proba not available, synthesize from pred only
+            proba = float(pred)
 
-st.caption("Built with scikit-learn pipelines • Median imputation + Standardization • Auto-plots for ROC/PR and Confusion Matrices.")
+        if pred == 1:
+            st.error("Prediction: **Diabetes**")
+        else:
+            st.success("Prediction: **No Diabetes**")
+
+        
+
+st.caption("Built with scikit-learn pipelines-plots for ROC/PR and Confusion Matrices.")
