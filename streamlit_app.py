@@ -251,19 +251,42 @@ with tab5:
     fig_bar.tight_layout()
     st.pyplot(fig_bar)
 
-
 with tab6:
     st.subheader("Predict for a Single Person")
-    st.caption("Binary features (0/1) are shown as dropdowns. Others are text boxes. Empty/invalid inputs fallback to training **median**.")
+    st.caption("Binary features (0/1) are shown as dropdowns with labels. "
+               "Other features are text boxes with **observed ranges** from the training data. "
+               "Blank/invalid inputs fall back to the training **median**.")
+
+    # Semantic labels for common binary fields (applied only if the column exists)
+    BINARY_LABELS = {
+        "Sex": {0: "Female (0)", 1: "Male (1)"},
+        "HighBP": {0: "No high blood pressure (0)", 1: "High blood pressure (1)"},
+        "HighChol": {0: "No high cholesterol (0)", 1: "High cholesterol (1)"},
+        "CholCheck": {0: "No cholesterol check (0)", 1: "Had cholesterol check (1)"},
+        "Smoker": {0: "Non-smoker (0)", 1: "Smoker (1)"},
+        "Stroke": {0: "No stroke history (0)", 1: "Stroke history (1)"},
+        "HeartDiseaseorAttack": {0: "No heart disease/attack (0)", 1: "Heart disease/attack (1)"},
+        "PhysActivity": {0: "No physical activity (0)", 1: "Physically active (1)"},
+        "Fruits": {0: "<1 serving/day (0)", 1: "≥1 serving/day (1)"},
+        "Veggies": {0: "<1 serving/day (0)", 1: "≥1 serving/day (1)"},
+        "HvyAlcoholConsump": {0: "No (0)", 1: "Heavy alcohol consumption (1)"},
+        "AnyHealthcare": {0: "No healthcare access (0)", 1: "Has healthcare access (1)"},
+        "NoDocbcCost": {0: "No cost barrier (0)", 1: "Could not see doctor due to cost (1)"},
+        "DiffWalk": {0: "No difficulty walking (0)", 1: "Difficulty walking (1)"},
+        # Add more if your dataset has other named binaries
+    }
 
     defaults = X_train.median(numeric_only=True)
+    mins = X_train.min(numeric_only=True)
+    maxs = X_train.max(numeric_only=True)
+    p5 = X_train.quantile(0.05, numeric_only=True)
+    p95 = X_train.quantile(0.95, numeric_only=True)
 
-    # Detect binary columns: non-null unique values subset of {0,1}
+    # Detect binary columns (unique values subset of {0,1})
     binary_cols = set()
     for col in X.columns:
         vals = pd.Series(X[col]).dropna().unique()
         if len(vals) > 0:
-            # Coerce to floats then compare set membership
             try:
                 vals = np.array(vals, dtype=float)
                 unique_set = set(np.unique(vals).tolist())
@@ -278,31 +301,54 @@ with tab6:
     for i, col in enumerate(X.columns):
         with cols_layout[i % 3]:
             if col in binary_cols:
-                # Default to rounded median within {0,1}
+                # Default selection from training median
                 dflt = defaults.get(col, 0.0)
                 try:
                     dflt = int(round(float(dflt)))
                 except Exception:
                     dflt = 0
                 dflt = 1 if dflt == 1 else 0
-                choice = st.selectbox(col, options=[0,1], index=[0,1].index(dflt))
+
+                # Build a format function using semantic labels if available
+                label_map = BINARY_LABELS.get(col, {0: "No (0)", 1: "Yes (1)"})
+                fmt = lambda v, m=label_map: m.get(v, str(v))
+
+                choice = st.selectbox(
+                    col,
+                    options=[0, 1],
+                    index=[0, 1].index(dflt),
+                    format_func=fmt,
+                    help=label_map.get(1, "1 = Yes") + " | " + label_map.get(0, "0 = No")
+                )
                 user_input_raw[col] = choice
             else:
-                placeholder = "" if pd.isna(defaults.get(col, np.nan)) else str(float(defaults[col]))
-                txt = st.text_input(col, value="", placeholder=placeholder)
+                # Build help text with observed ranges
+                mn = float(mins.get(col, np.nan)) if col in mins.index else np.nan
+                mx = float(maxs.get(col, np.nan)) if col in maxs.index else np.nan
+                q5 = float(p5.get(col, np.nan)) if col in p5.index else np.nan
+                q95 = float(p95.get(col, np.nan)) if col in p95.index else np.nan
+                med = float(defaults.get(col, 0.0)) if col in defaults.index else 0.0
+
+                rng_parts = []
+                if not np.isnan(mn) and not np.isnan(mx):
+                    rng_parts.append(f"Observed range: **{mn:.3g}–{mx:.3g}**")
+                if not np.isnan(q5) and not np.isnan(q95):
+                    rng_parts.append(f"Typical (5–95%): **{q5:.3g}–{q95:.3g}**")
+                rng_parts.append(f"Median: **{med:.3g}**")
+                help_str = " | ".join(rng_parts)
+
+                placeholder = "" if pd.isna(med) else str(med)
+                txt = st.text_input(col, value="", placeholder=placeholder, help=help_str)
                 user_input_raw[col] = txt
 
-    # Build parsed dataframe
+    # Parse into model-ready row
     parsed = {}
     parse_warnings = []
-
     for col in X.columns:
         val = user_input_raw[col]
         if col in binary_cols:
-            # Already int 0/1 from selectbox
             parsed[col] = int(val)
         else:
-            # Text -> float with median fallback
             if val is None or str(val).strip() == "":
                 parsed[col] = float(defaults[col]) if pd.notna(defaults[col]) else 0.0
             else:
@@ -320,8 +366,6 @@ with tab6:
             st.warning(f"These fields were non-numeric and were replaced by their median: {', '.join(parse_warnings)}")
 
         mdl = fitted[chosen_model]
-
-        # Probability + class using current threshold
         if hasattr(mdl.named_steps["clf"], "predict_proba"):
             proba = mdl.predict_proba(input_df)[0, 1]
             pred = int(proba >= threshold)
@@ -331,10 +375,13 @@ with tab6:
             pred = int(proba >= threshold)
         else:
             pred = int(mdl.predict(input_df)[0])
-            # If proba not available, synthesize from pred only
             proba = float(pred)
 
         if pred == 1:
             st.error("Prediction: **Diabetes**")
         else:
             st.success("Prediction: **No Diabetes**")
+
+        st.caption(f"Estimated probability (if available): {proba:.3f}")
+
+st.caption("Built with scikit-learn pipelines • Median imputation + Standardization • Auto-plots for ROC/PR and Confusion Matrices.")
