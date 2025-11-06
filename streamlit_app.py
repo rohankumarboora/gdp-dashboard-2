@@ -381,7 +381,3 @@ with tab6:
             st.error("Prediction: **Diabetes**")
         else:
             st.success("Prediction: **No Diabetes**")
-
-        st.caption(f"Estimated probability (if available): {proba:.3f}")
-
-st.caption("Built with scikit-learn pipelines • Median imputation + Standardization • Auto-plots for ROC/PR and Confusion Matrices.")
